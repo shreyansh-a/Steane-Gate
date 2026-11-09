@@ -183,3 +183,112 @@ class Steane_Circuit(_Circuit):
             if observable is not None:
                 self.observable(out[i], observable + i)
         return out
+
+
+class LookupDecoder:
+    """
+    Most-likely-observable decoder built from the circuit's detector error model.
+
+    Enumerates every combination of at most `max_weight` (1 to 3) error
+    mechanisms and, for each syndrome, stores the most probable set of
+    observable flips. All observables are decoded jointly.
+
+    `postselect` lists detector indices used to discard shots rather than to
+    decode. Combinations that fire any of them are excluded, but combinations
+    whose effects on them cancel still count, since those shots are kept.
+    Use `accepted` to find the kept shots.
+    """
+
+    def __init__(self, circuit, max_weight=3, postselect=()):
+        if max_weight not in (1, 2, 3):
+            raise ValueError("max_weight must be 1, 2 or 3")
+        num_detectors = circuit.num_detectors
+        post_ids = sorted({int(d) for d in postselect})
+        if post_ids and not 0 <= post_ids[0] <= post_ids[-1] < num_detectors:
+            raise ValueError("postselect contains an index that is not a detector")
+        post_set = set(post_ids)
+        keep_ids = [d for d in range(num_detectors) if d not in post_set]
+        if max(len(keep_ids), len(post_ids), circuit.num_observables) > 62:
+            raise ValueError("at most 62 decoded detectors, 62 postselected "
+                             "detectors and 62 observables fit an int64 lookup key")
+        self.num_detectors = num_detectors
+        self.num_observables = circuit.num_observables
+        self.post = np.array(post_ids, dtype=int)
+        self.keep = np.array(keep_ids, dtype=int)
+        keep_col = {d: i for i, d in enumerate(keep_ids)}
+        post_col = {d: i for i, d in enumerate(post_ids)}
+
+        merged = {}  # (syndrome bits, postselection bits, observable bits) -> probability
+        for inst in circuit.detector_error_model(decompose_errors=False).flattened():
+            if inst.type != "error":
+                continue
+            syn, post, obs = 0, 0, 0
+            for t in inst.targets_copy():
+                if t.is_relative_detector_id():
+                    if t.val in post_col:
+                        post ^= 1 << post_col[t.val]
+                    else:
+                        syn ^= 1 << keep_col[t.val]
+                elif t.is_logical_observable_id():
+                    obs ^= 1 << t.val
+            if syn or post or obs:
+                p, q = merged.get((syn, post, obs), 0.0), inst.args_copy()[0]
+                merged[(syn, post, obs)] = p * (1 - q) + q * (1 - p)
+
+        syn, post, obs = (np.array([k[n] for k in merged], dtype=np.int64) for n in range(3))
+        odds = np.array([v / (1 - v) for v in merged.values()], dtype=float)
+
+        # The no-error case: empty syndrome, no flips, weight 1.
+        chunks = [(np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int64), np.ones(1))]
+
+        def add(s, p, o, w):
+            survives = p == 0
+            chunks.append((s[survives], o[survives], w[survives]))
+
+        add(syn, post, obs, odds)
+        if max_weight >= 2:
+            i, j = np.triu_indices(len(syn), k=1)
+            ps, pp, po, pw = syn[i] ^ syn[j], post[i] ^ post[j], obs[i] ^ obs[j], odds[i] * odds[j]
+            add(ps, pp, po, pw)
+        if max_weight >= 3:
+            # pairs are sorted by their first index, so pairs (j,k) with j > a start at start[a+1]
+            start = np.searchsorted(i, np.arange(len(syn) + 1))
+            for a in range(len(syn) - 2):
+                sl = slice(start[a + 1], None)
+                add(syn[a] ^ ps[sl], post[a] ^ pp[sl], obs[a] ^ po[sl], odds[a] * pw[sl])
+        s_all, o_all, w_all = map(np.concatenate, zip(*chunks))
+
+        # Total probability of each (syndrome, observable flips) pair.
+        order = np.lexsort((o_all, s_all))
+        s_all, o_all, w_all = s_all[order], o_all[order], w_all[order]
+        first = np.flatnonzero(np.r_[True, (s_all[1:] != s_all[:-1]) | (o_all[1:] != o_all[:-1])])
+        mass = np.add.reduceat(w_all, first)
+        s_all, o_all = s_all[first], o_all[first]
+
+        # For each syndrome keep the largest mass; ties go to the smaller observable mask.
+        order = np.lexsort((-o_all, mass, s_all))
+        s_all, o_all = s_all[order], o_all[order]
+        last = np.r_[s_all[1:] != s_all[:-1], True]
+        self.keys = s_all[last]
+        self.masks = o_all[last]
+
+    def _check(self, dets):
+        dets = np.asarray(dets, dtype=bool)
+        if dets.ndim != 2 or dets.shape[1] != self.num_detectors:
+            raise ValueError(f"dets must have shape (shots, {self.num_detectors})")
+        return dets
+
+    def accepted(self, dets):
+        """Boolean array of shape (shots,): True where no postselected detector fired."""
+        return ~self._check(dets)[:, self.post].any(axis=1)
+
+    def decode(self, dets):
+        """
+        Predicted observable flips, as a boolean array of shape
+        (shots, num_observables). Unseen syndromes get no correction.
+        """
+        bits = self._check(dets)[:, self.keep].astype(np.int64)
+        s = bits @ (1 << np.arange(bits.shape[1], dtype=np.int64))
+        pos = np.clip(np.searchsorted(self.keys, s), 0, len(self.keys) - 1)
+        masks = np.where(self.keys[pos] == s, self.masks[pos], 0)
+        return (masks[:, None] >> np.arange(self.num_observables, dtype=np.int64)) & 1 == 1
